@@ -1,4 +1,4 @@
-const API_URL = "https://ainewschat.onrender.com/"; // Update to your deployed URL later (e.g., Heroku)
+const API_URL = "https://ainewschat.onrender.com"; // Update to your deployed URL later (e.g., Heroku)
 
 function startVoiceInput() {
     const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
