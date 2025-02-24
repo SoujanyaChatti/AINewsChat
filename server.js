@@ -2,11 +2,15 @@ const express = require('express');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const path = require('path');
+const NodeCache = require('node-cache'); // Already installed
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Cache for 1 hour to reduce API requests
+const cache = new NodeCache({ stdTTL: 3600 });
 
 // Middleware
 app.use(express.json());
@@ -32,7 +36,7 @@ function limitWords(text, maxWords = 450) {
     return text;
 }
 
-// News report generation with Mistral (via API call)
+// News report generation with Mistral and World News API
 app.get('/news_report', async (req, res) => {
     const topic = req.query.topic;
     const debate = req.query.debate === 'true';
@@ -42,18 +46,25 @@ app.get('/news_report', async (req, res) => {
         return res.json({ error: "Please enter a topic." });
     }
 
+    const cacheKey = `${topic}-${debate}-${area || ''}`;
+    const cachedResponse = cache.get(cacheKey);
+    if (cachedResponse) {
+        console.log(`Returning cached response for ${topic}`);
+        return res.json(cachedResponse);
+    }
+
     try {
         const processedTopic = cleanQuery(topic);
-        const newsUrl = `https://newsapi.org/v2/everything?q=${encodeURIComponent(processedTopic)}&language=en&apiKey=${process.env.NEWS_API_KEY}`;
-        console.log(`Fetching news from: ${newsUrl}`);
-        const newsResponse = await axios.get(newsUrl, { timeout: 10000 });
+        const worldNewsUrl = `https://api.worldnewsapi.com/search-news?text=${encodeURIComponent(processedTopic)}&api-key=${process.env.WORLD_NEWS_API_KEY}&language=en`;
+        console.log(`Fetching news from: ${worldNewsUrl}`);
+        const worldNewsResponse = await axios.get(worldNewsUrl, { timeout: 10000 });
 
-        if (newsResponse.status !== 200) {
-            console.log(`NewsAPI error - Status: ${newsResponse.status}, Data: ${JSON.stringify(newsResponse.data)}`);
+        if (worldNewsResponse.status !== 200) {
+            console.log(`World News API error - Status: ${worldNewsResponse.status}, Data: ${JSON.stringify(worldNewsResponse.data)}`);
             return res.json({ error: "Failed to fetch news" });
         }
 
-        const articles = newsResponse.data.articles.slice(0, 5);
+        const articles = worldNewsResponse.data.news.slice(0, 5);
         if (!articles.length) {
             return res.json({ error: "No relevant articles found" });
         }
@@ -61,7 +72,7 @@ app.get('/news_report', async (req, res) => {
         if (area) {
             const filteredArticles = articles.filter(a => 
                 a.title.toLowerCase().includes(area.toLowerCase()) || 
-                (a.description && a.description.toLowerCase().includes(area.toLowerCase()))
+                a.text.toLowerCase().includes(area.toLowerCase())
             );
             if (!filteredArticles.length) {
                 return res.json({ error: `No news found for ${processedTopic} in ${area}` });
@@ -69,17 +80,17 @@ app.get('/news_report', async (req, res) => {
             articles = filteredArticles;
         }
 
-        const newsContent = articles.map(a => `Title: ${a.title}\nSummary: ${a.description}`).join("\n\n");
+        const newsContent = articles.map(a => `Title: ${a.title}\nSummary: ${a.text.substring(0, 200)}`).join("\n\n");
 
         let prompt = `You are an AI news reporter. Create a concise news report (max 450 words, ~3 minutes at 150 wpm) based on:\n\n${newsContent}\n\nKeep it engaging and structured.`;
         if (debate) {
             prompt += "\n\n**Format:**\n1. A debate between Alice and Bob (max 300 words total):\n   - **Alice** argues FOR the topic (1-2 sentences per turn).\n   - **Bob** argues AGAINST the topic (1-2 sentences per turn).\n   - At least 3 rounds of exchange.\n   - Use 'Alice: ' and 'Bob: ' prefixes.\n2. A neutral summary (max 150 words).";
         }
 
-        // Call Mistral API (no official JS library, use axios)
-        const mistralUrl = "https://api.mistral.ai/v1/chat/completions"; // Check Mistral docs for exact endpoint
+        console.log(`Sending prompt to Mistral: ${prompt.substring(0, 100)}...`);
+        const mistralUrl = "https://api.mistral.ai/v1/chat/completions"; // Verify with Mistral docs
         const mistralResponse = await axios.post(mistralUrl, {
-            model: "mistral-tiny", // Match your FastAPI model
+            model: "mistral-tiny",
             messages: [{ role: "user", content: prompt }],
         }, {
             headers: {
@@ -96,10 +107,9 @@ app.get('/news_report', async (req, res) => {
         const newsReport = limitWords(mistralResponse.data.choices[0].message.content);
         console.log(`Generated report (${newsReport.split(' ').length} words):\n${newsReport}`);
 
-        // Generate TTS using fal (via axios, replacing FAL_TTS_V3_ENDPOINT/FAL_TTS_DIALOG_ENDPOINT)
         let audioUrl;
         try {
-            const ttsEndpoint = debate ? FAL_TTS_DIALOG_ENDPOINT : FAL_TTS_V3_ENDPOINT;
+            const ttsEndpoint = debate ? "https://fal.run/fal-ai/playai/tts/dialog" : "https://fal.run/fal-ai/playai/tts/v3";
             const ttsPayload = {
                 input: newsReport,
                 response_format: "url"
@@ -113,6 +123,7 @@ app.get('/news_report', async (req, res) => {
                 ttsPayload.voice = "Jennifer (English (US)/American)";
             }
 
+            console.log(`Sending TTS request to ${ttsEndpoint} with payload: ${JSON.stringify(ttsPayload)}`);
             const ttsResponse = await axios.post(ttsEndpoint, ttsPayload, {
                 headers: {
                     "Authorization": `Key ${process.env.FAL_API_KEY}`,
@@ -132,7 +143,9 @@ app.get('/news_report', async (req, res) => {
             audioUrl = null;
         }
 
-        res.json({ report: newsReport, audio_url: audioUrl || "https://example.com/audio.mp3" }); // Fallback if TTS fails
+        const response = { report: newsReport, audio_url: audioUrl || "https://example.com/fallback-audio.mp3" };
+        cache.set(cacheKey, response); // Cache successful response
+        res.json(response);
     } catch (error) {
         console.error(`Error in news_report: ${error.message}`);
         if (error.response) {
@@ -145,7 +158,3 @@ app.get('/news_report', async (req, res) => {
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
 });
-
-// Note: FAL_TTS_DIALOG_ENDPOINT and FAL_TTS_V3_ENDPOINT are defined as constants at the top
-const FAL_TTS_DIALOG_ENDPOINT = "https://fal.run/fal-ai/playai/tts/dialog";
-const FAL_TTS_V3_ENDPOINT = "https://fal.run/fal-ai/playai/tts/v3";
